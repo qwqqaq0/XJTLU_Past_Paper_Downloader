@@ -1,0 +1,11 @@
+{
+  "course_codes": [
+    "CPT102",
+    "CPT104",
+    "INT102",
+    "INT104"
+  ],
+  "login_timeout": 300,
+  "max_clicks": 0,
+  "headless": false
+}
