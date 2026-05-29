@@ -14,6 +14,22 @@ PROFILE_DIR = BASE_DIR / ".browser_profile"
 DEFAULT_CONFIG = BASE_DIR / "downloader.config.json"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+COURSE_CODE_RE = re.compile(r"([A-Z]{2,4})[-_\s]?(\d{3})", re.I)
+CURRENT_DOWNLOAD_COURSE_CODE: str | None = None
+DETAIL_WAIT_MS = 800
+VIEW_ONLINE_WAIT_MS = 5000
+FINAL_WAIT_MS = 3000
+PDF_SAVE_EVENT: asyncio.Event | None = None
+PDF_SAVE_COUNT = 0
+
+
+def notify_pdf_saved() -> None:
+    global PDF_SAVE_COUNT
+
+    PDF_SAVE_COUNT += 1
+    if PDF_SAVE_EVENT is not None:
+        PDF_SAVE_EVENT.set()
+
 AUTH_HOST_HINTS = (
     "trust.xjtlu.edu.cn",
     "uim.xjtlu.edu.cn",
@@ -55,13 +71,39 @@ def pick_filename_from_headers(headers: dict) -> str:
     return "unknown_paper.pdf"
 
 
-def unique_path(filename: str) -> Path:
-    path = DOWNLOAD_DIR / safe_name(filename)
+def unique_path(filename: str, course_code: str | None = None) -> Path:
+    path = download_path(filename, course_code)
     i = 1
     while path.exists():
-        path = DOWNLOAD_DIR / f"{path.stem}({i}){path.suffix}"
+        path = path.parent / f"{path.stem}({i}){path.suffix}"
         i += 1
     return path
+
+
+def normalize_course_code(course_code: str | None) -> str | None:
+    if not course_code:
+        return None
+    match = COURSE_CODE_RE.search(course_code)
+    if not match:
+        return None
+    prefix = match.group(1).upper()
+    return f"{prefix}{match.group(2)}"
+
+
+def classify_download_dir(filename: str, course_code: str | None = None) -> Path:
+    normalized = normalize_course_code(course_code) or normalize_course_code(filename)
+    if not normalized:
+        return DOWNLOAD_DIR / "Unknown"
+
+    prefix = re.match(r"[A-Z]+", normalized).group(0)
+    return DOWNLOAD_DIR / prefix / normalized
+
+
+def download_path(filename: str, course_code: str | None = None) -> Path:
+    filename = safe_name(filename)
+    folder = classify_download_dir(filename, course_code)
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / filename
 
 
 async def save_pdf_response(resp, downloaded_urls: set[str]) -> Path | None:
@@ -83,17 +125,19 @@ async def save_pdf_response(resp, downloaded_urls: set[str]) -> Path | None:
         return None
 
     downloaded_urls.add(url)
-    path = unique_path(pick_filename_from_headers(resp.headers))
+    path = unique_path(pick_filename_from_headers(resp.headers), CURRENT_DOWNLOAD_COURSE_CODE)
     path.write_bytes(body)
     print(f"[Saved] {path}")
+    notify_pdf_saved()
     return path
 
 
 async def save_playwright_download(download: Download) -> None:
     filename = download.suggested_filename or "unknown_paper.pdf"
-    path = unique_path(filename)
+    path = unique_path(filename, CURRENT_DOWNLOAD_COURSE_CODE)
     await download.save_as(path)
     print(f"[Saved] {path}")
+    notify_pdf_saved()
 
 
 async def body_text(page: Page) -> str:
@@ -252,6 +296,16 @@ async def find_exam_page(page: Page) -> Page | None:
     return None
 
 
+async def find_search_page(page: Page) -> Page | None:
+    for candidate in reversed(page.context.pages):
+        try:
+            if await candidate.locator(".paper-search input[type=text], input[type=text]").count() > 0:
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
 async def close_stale_exam_pages(context, keep_page: Page) -> None:
     for candidate in list(context.pages):
         if candidate == keep_page:
@@ -320,10 +374,10 @@ async def wait_for_exam_page(page: Page, timeout_ms: int = 20000) -> str:
     raise RuntimeError(f"Past Exam Papers page did not load agreement/search UI. Current URL: {page.url}. Text: {text}")
 
 
-async def accept_user_agreement(page: Page) -> None:
+async def accept_user_agreement(page: Page, login_timeout: int) -> Page:
     state = await wait_for_exam_page(page)
     if state == "search":
-        return
+        return page
 
     print("[Step] Accepting User Agreement")
 
@@ -362,12 +416,24 @@ async def accept_user_agreement(page: Page) -> None:
 
     deadline = asyncio.get_running_loop().time() + 10
     while asyncio.get_running_loop().time() < deadline:
-        if await page.locator(".paper-search input[type=text], input[type=text]").count() > 0:
-            return
-        if "/SearchDetail/EXAMXJTLU" in page.url:
-            await page.wait_for_timeout(500)
-        else:
-            await page.wait_for_timeout(500)
+        search_page = await find_search_page(page)
+        if search_page is not None:
+            return search_page
+        await page.wait_for_timeout(500)
+
+    if "#/index" in page.url:
+        text = await body_text(page)
+        if "Please log in first" in text or ("User Login" in text and "Login Successfully" not in text):
+            print("[Step] Login expired after agreement; logging in again")
+            await ensure_logged_in_from_home(page, login_timeout)
+
+        print("[Step] Agreement returned to home; reopening Past Exam Papers")
+        reopened_page = await open_past_exam_papers(page)
+        search_page = await find_search_page(reopened_page)
+        if search_page is not None:
+            return search_page
+        if "User Agreement" in await body_text(reopened_page):
+            return await accept_user_agreement(reopened_page, login_timeout)
 
     text = (await body_text(page)).replace("\n", " ")[:500]
     raise RuntimeError(f"Agree click did not show the paper search input. Current URL: {page.url}. Text: {text}")
@@ -403,12 +469,17 @@ def result_links(page: Page):
 async def collect_result_infos(page: Page) -> list[dict]:
     return await page.evaluate(
         """() => [...document.querySelectorAll('table.paper-search-list tbody tr')]
-            .map(row => {
+            .map((row, index) => {
                 const a = row.querySelector('td:first-child a') || row.querySelector('a');
                 if (!a) return null;
+                const cells = [...row.querySelectorAll('td')].map(td => (td.innerText || td.textContent || '').replace(/\\s+/g, ' ').trim());
+                const rowText = (row.innerText || row.textContent || '').replace(/\\s+/g, ' ').trim();
                 return {
+                    index,
                     text: (a.innerText || a.textContent || '').replace(/\\s+/g, ' ').trim(),
-                    href: a.href || a.getAttribute('href') || ''
+                    href: a.href || a.getAttribute('href') || '',
+                    paperCode: cells[1] || '',
+                    rowText
                 };
             })
             .filter(Boolean)
@@ -425,17 +496,17 @@ async def open_result_in_new_tab(page: Page, course_code: str, index: int, info:
     if href and not href.startswith("javascript:"):
         detail_page = await page.context.new_page()
         await detail_page.goto(href, wait_until="domcontentloaded", timeout=60000)
-        await settle(detail_page, 1800)
+        await settle(detail_page, DETAIL_WAIT_MS)
         return detail_page
 
-    link = links.nth(index)
+    link = links.nth(int(info.get("index", index)))
     await link.scroll_into_view_if_needed(timeout=3000)
     before_pages = set(page.context.pages)
     try:
         async with page.context.expect_page(timeout=5000) as page_info:
             await link.click(button="middle", timeout=5000)
         detail_page = await page_info.value
-        await settle(detail_page, 1800)
+        await settle(detail_page, DETAIL_WAIT_MS)
         return detail_page
     except Exception:
         await link.click(timeout=5000, modifiers=["Control"])
@@ -443,7 +514,7 @@ async def open_result_in_new_tab(page: Page, course_code: str, index: int, info:
             new_pages = [p for p in page.context.pages if p not in before_pages]
             if new_pages:
                 detail_page = new_pages[-1]
-                await settle(detail_page, 1800)
+                await settle(detail_page, DETAIL_WAIT_MS)
                 return detail_page
             await page.wait_for_timeout(250)
 
@@ -451,6 +522,8 @@ async def open_result_in_new_tab(page: Page, course_code: str, index: int, info:
 
 
 async def click_view_online(page: Page) -> None:
+    global PDF_SAVE_EVENT
+
     print("[Step] Clicking View Online")
     view_button = page.locator("button.view-btn, .view-btn").filter(has_text="View Online")
     if await view_button.count() == 0:
@@ -459,13 +532,24 @@ async def click_view_online(page: Page) -> None:
         raise RuntimeError("View Online button was not found on the detail page.")
 
     before_pages = set(page.context.pages)
+    before_saved = PDF_SAVE_COUNT
+    if PDF_SAVE_EVENT is not None:
+        PDF_SAVE_EVENT.clear()
+
     await view_button.first.click(timeout=5000)
-    await page.wait_for_timeout(3500)
+    if PDF_SAVE_EVENT is not None:
+        try:
+            await asyncio.wait_for(PDF_SAVE_EVENT.wait(), timeout=VIEW_ONLINE_WAIT_MS / 1000)
+        except asyncio.TimeoutError:
+            if PDF_SAVE_COUNT == before_saved:
+                print("[Warn] Timed out waiting for PDF save after View Online.")
+    else:
+        await page.wait_for_timeout(VIEW_ONLINE_WAIT_MS)
 
     for opened_page in [p for p in page.context.pages if p not in before_pages]:
         try:
             await opened_page.wait_for_load_state("domcontentloaded", timeout=8000)
-            await opened_page.wait_for_timeout(1500)
+            await opened_page.wait_for_timeout(300)
         except Exception:
             pass
         try:
@@ -474,32 +558,152 @@ async def click_view_online(page: Page) -> None:
             pass
 
 
-async def download_course_papers(page: Page, course_code: str, max_clicks: int) -> None:
-    await search_course(page, course_code)
-    result_infos = await collect_result_infos(page)
-    displayed_total = len(result_infos)
-    total = min(displayed_total, max_clicks) if max_clicks > 0 else displayed_total
-    if total == 0:
-        print("[Warn] No result links found after search.")
-        return
+async def next_results_page(page: Page) -> bool:
+    before_infos = await collect_result_infos(page)
+    before_key = result_key(before_infos[0]) if before_infos else ""
+    before_page = await active_page_number(page)
+    next_page = ""
+    if before_page.isdigit():
+        next_page = str(int(before_page) + 1)
 
-    print(f"[Step] Found {displayed_total} displayed result link(s); will open {total}")
-    for index in range(total):
-        detail_page = await open_result_in_new_tab(page, course_code, index, result_infos[index])
+    clicked = False
+    click_targets = []
+    if next_page:
+        click_targets.append(page.locator(f".ivu-page li.ivu-page-item[title='{next_page}']"))
+    click_targets.append(page.locator(".ivu-page li.ivu-page-next:not(.ivu-page-disabled), .ivu-page-next:not(.ivu-page-disabled)"))
+
+    for target in click_targets:
+        if clicked:
+            break
+        if await target.count() == 0:
+            continue
+        button = target.last
         try:
-            await click_view_online(detail_page)
-        finally:
+            await button.scroll_into_view_if_needed(timeout=3000)
+            await button.click(timeout=5000)
+            clicked = True
+        except Exception:
             try:
-                await detail_page.close()
+                box = await button.bounding_box(timeout=2000)
+                if box:
+                    await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                    clicked = True
             except Exception:
                 pass
-            await page.bring_to_front()
+
+    if not clicked:
+        return False
+
+    for _ in range(40):
+        await page.wait_for_timeout(250)
+        after_infos = await collect_result_infos(page)
+        after_key = result_key(after_infos[0]) if after_infos else ""
+        after_page = await active_page_number(page)
+        if (after_page and after_page != before_page) or (after_key and after_key != before_key):
+            await settle(page, 500)
+            print(f"[Step] Moved to result page {after_page or '?'}")
+            return True
+
+    print(f"[Warn] Next page click did not change results; active page stayed {before_page or '?'}.")
+    return False
 
 
-async def run(course_codes: list[str], login_timeout: int, max_clicks: int, headless: bool) -> None:
-    course_codes = [code.strip().upper() for code in course_codes if code.strip()]
-    if not course_codes:
-        raise RuntimeError("No course codes were provided.")
+async def active_page_number(page: Page) -> str:
+    try:
+        text = await page.locator(".ivu-page-item-active").last.inner_text(timeout=1000)
+        return text.strip()
+    except Exception:
+        return ""
+
+
+def result_key(info: dict) -> str:
+    return info.get("href") or info.get("rowText") or info.get("text") or ""
+
+
+async def download_search_results(page: Page, search_term: str, max_results: int, max_pages: int, dry_run: bool) -> None:
+    global CURRENT_DOWNLOAD_COURSE_CODE
+
+    seen: set[str] = set()
+    downloaded = 0
+    page_number = 1
+
+    while True:
+        result_infos = await collect_result_infos(page)
+        fresh_infos = []
+        for info in result_infos:
+            key = result_key(info)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            fresh_infos.append(info)
+
+        if not result_infos and page_number == 1:
+            print("[Warn] No result links found after search.")
+            return
+
+        print(f"[Step] Page {page_number}: {len(result_infos)} displayed result(s), {len(fresh_infos)} new")
+        for index, info in enumerate(fresh_infos):
+            if max_results > 0 and downloaded >= max_results:
+                print(f"[Step] Reached max results for {search_term}: {max_results}")
+                return
+
+            if dry_run:
+                title = info.get("text") or "Untitled"
+                paper_code = info.get("paperCode") or search_term
+                print(f"[DryRun] Result {downloaded + 1}: {paper_code} - {title}")
+                downloaded += 1
+                continue
+
+            detail_page = await open_result_in_new_tab(page, search_term, index, info)
+            try:
+                CURRENT_DOWNLOAD_COURSE_CODE = info.get("paperCode") or search_term
+                print(f"[Step] Classifying download as: {CURRENT_DOWNLOAD_COURSE_CODE}")
+                await click_view_online(detail_page)
+                downloaded += 1
+            finally:
+                CURRENT_DOWNLOAD_COURSE_CODE = None
+                try:
+                    await detail_page.close()
+                except Exception:
+                    pass
+                await page.bring_to_front()
+
+        if max_pages > 0 and page_number >= max_pages:
+            print(f"[Step] Reached max pages for {search_term}: {max_pages}")
+            return
+
+        if not await next_results_page(page):
+            print(f"[Step] Finished {search_term}: downloaded {downloaded} result(s)")
+            return
+        page_number += 1
+
+
+async def download_course_papers(page: Page, course_code: str, max_results: int, max_pages: int, dry_run: bool) -> None:
+    await search_course(page, course_code)
+    await download_search_results(page, course_code, max_results, max_pages, dry_run)
+
+
+async def run(
+    search_terms: list[str],
+    login_timeout: int,
+    max_results: int,
+    max_pages: int,
+    headless: bool,
+    detail_wait_ms: int,
+    view_online_wait_ms: int,
+    final_wait_ms: int,
+    dry_run: bool,
+) -> None:
+    global DETAIL_WAIT_MS, VIEW_ONLINE_WAIT_MS, FINAL_WAIT_MS, PDF_SAVE_EVENT
+
+    DETAIL_WAIT_MS = detail_wait_ms
+    VIEW_ONLINE_WAIT_MS = view_online_wait_ms
+    FINAL_WAIT_MS = final_wait_ms
+    PDF_SAVE_EVENT = asyncio.Event()
+
+    search_terms = [code.strip().upper() for code in search_terms if code.strip()]
+    if not search_terms:
+        raise RuntimeError("No course codes or prefixes were provided.")
 
     downloaded_urls: set[str] = set()
     pending_tasks: set[asyncio.Task] = set()
@@ -543,14 +747,15 @@ async def run(course_codes: list[str], login_timeout: int, max_clicks: int, head
             page = context.pages[0] if context.pages else await context.new_page()
             await ensure_logged_in_from_home(page, login_timeout)
             page = await open_past_exam_papers(page)
-            await accept_user_agreement(page)
+            page = await accept_user_agreement(page, login_timeout)
 
-            for course_code in course_codes:
-                print(f"[Course] {course_code}")
-                await download_course_papers(page, course_code, max_clicks)
+            for search_term in search_terms:
+                print(f"[SearchTerm] {search_term}")
+                await download_course_papers(page, search_term, max_results, max_pages, dry_run)
 
-            print("[Wait] Listening for final PDF responses for 20 seconds.")
-            await page.wait_for_timeout(20000)
+            if not dry_run:
+                print(f"[Wait] Listening for final PDF responses for {FINAL_WAIT_MS} ms.")
+                await page.wait_for_timeout(FINAL_WAIT_MS)
             print(f"[Done] Download directory: {DOWNLOAD_DIR}")
         finally:
             if pending_tasks:
@@ -565,22 +770,32 @@ def read_config(path: Path) -> dict:
         return json.load(file)
 
 
-def normalize_course_codes(value) -> list[str]:
+def normalize_search_terms(value) -> list[str]:
     if value is None:
         return []
     if isinstance(value, str):
         return [item.strip().upper() for item in re.split(r"[,;\s]+", value) if item.strip()]
     if isinstance(value, list):
-        return [str(item).strip().upper() for item in value if str(item).strip()]
-    raise ValueError("course_codes must be a string or a list.")
+        terms = []
+        for item in value:
+            terms.extend(normalize_search_terms(str(item)))
+        return terms
+    raise ValueError("course_codes/course_prefixes must be a string or a list.")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Auto download XJTLU past papers by course code.")
     parser.add_argument("course_codes", nargs="*", help="Course code(s), e.g. INT102 CPT102")
+    parser.add_argument("--prefix", "--prefixes", dest="prefixes", action="append", default=[], help="Course prefix(es), e.g. SAT,CAN,CPT or --prefix SAT --prefix CPT")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="Config JSON path. Default: downloader.config.json")
     parser.add_argument("--login-timeout", type=int, default=None, help="Seconds to wait for login. Default: config or 300")
-    parser.add_argument("--max-clicks", type=int, default=None, help="Max result links per course. Default: config or 0, meaning all displayed links")
+    parser.add_argument("--max-results", type=int, default=None, help="Max result links per search term across pages. Default: config or 0, meaning all")
+    parser.add_argument("--max-clicks", type=int, default=None, help="Deprecated alias for --max-results")
+    parser.add_argument("--max-pages", type=int, default=None, help="Max result pages per search term. Default: config or 0, meaning all pages")
+    parser.add_argument("--detail-wait-ms", type=int, default=None, help="Wait after opening each detail page. Default: config or 800")
+    parser.add_argument("--view-wait-ms", type=int, default=None, help="Max wait after clicking View Online. Default: config or 5000")
+    parser.add_argument("--final-wait-ms", type=int, default=None, help="Final PDF response wait. Default: config or 3000")
+    parser.add_argument("--dry-run", action="store_true", help="Search and paginate only; do not open detail pages or download PDFs.")
     parser.add_argument("--headless", action="store_true", help="Headless mode. Do not use this for first login.")
     return parser.parse_args()
 
@@ -589,19 +804,41 @@ async def main() -> None:
     args = parse_args()
     config = read_config(args.config)
 
-    course_codes = [code.upper() for code in args.course_codes]
-    if not course_codes:
-        course_codes = normalize_course_codes(config.get("course_codes"))
-    if not course_codes:
-        course_codes = normalize_course_codes(input("Course code(s), e.g. INT102 CPT102: ").strip())
-    if not course_codes:
-        raise SystemExit("Course code cannot be empty.")
+    course_codes = normalize_search_terms(args.course_codes)
+    cli_prefixes = normalize_search_terms(args.prefixes)
+
+    search_terms = course_codes + cli_prefixes
+    if not search_terms:
+        search_terms = normalize_search_terms(config.get("course_codes"))
+        search_terms += normalize_search_terms(config.get("course_prefixes"))
+    if not search_terms:
+        search_terms = normalize_search_terms(input("Course code(s) or prefix(es), e.g. INT102 CPT: ").strip())
+    if not search_terms:
+        raise SystemExit("Course code/prefix cannot be empty.")
 
     login_timeout = args.login_timeout if args.login_timeout is not None else int(config.get("login_timeout", 300))
-    max_clicks = args.max_clicks if args.max_clicks is not None else int(config.get("max_clicks", 0))
+    configured_max_results = config.get("max_results", config.get("max_clicks", 0))
+    max_results = args.max_results
+    if max_results is None:
+        max_results = args.max_clicks if args.max_clicks is not None else int(configured_max_results)
+    max_pages = args.max_pages if args.max_pages is not None else int(config.get("max_pages", 0))
     headless = args.headless or bool(config.get("headless", False))
+    detail_wait_ms = args.detail_wait_ms if args.detail_wait_ms is not None else int(config.get("detail_wait_ms", DETAIL_WAIT_MS))
+    view_online_wait_ms = args.view_wait_ms if args.view_wait_ms is not None else int(config.get("view_online_wait_ms", VIEW_ONLINE_WAIT_MS))
+    final_wait_ms = args.final_wait_ms if args.final_wait_ms is not None else int(config.get("final_wait_ms", FINAL_WAIT_MS))
+    dry_run = bool(args.dry_run or config.get("dry_run", False))
 
-    await run(course_codes, login_timeout, max_clicks, headless)
+    await run(
+        search_terms,
+        login_timeout,
+        max_results,
+        max_pages,
+        headless,
+        detail_wait_ms,
+        view_online_wait_ms,
+        final_wait_ms,
+        dry_run,
+    )
 
 
 if __name__ == "__main__":
